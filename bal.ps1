@@ -38,9 +38,9 @@ function Send-BalanceResult {
 
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host " STEAM WALLET BALANCE" -ForegroundColor Green
+    Write-Host "       STEAM WALLET BALANCE" -ForegroundColor Green
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host " Balance: $Balance" -ForegroundColor Yellow
+    Write-Host "  Balance: $Balance" -ForegroundColor Yellow
     Write-Host "========================================" -ForegroundColor Green
     Write-Host ""
 
@@ -240,6 +240,24 @@ function Get-SteamWalletBalance {
 
 $computerName = $env:COMPUTERNAME
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$stampPath = Join-Path $env:TEMP "bal_sent.flag"
+$cooldownMin = 20
+
+$createdNew = $false
+$mutex = New-Object System.Threading.Mutex($true, "Global\SteamBalParser", [ref]$createdNew)
+if (-not $createdNew) {
+    Write-Host "[i] Another bal.ps1 is already running, skip" -ForegroundColor Yellow
+    exit 0
+}
+
+if (Test-Path $stampPath) {
+    $age = (Get-Date) - (Get-Item $stampPath).LastWriteTime
+    if ($age.TotalMinutes -lt $cooldownMin) {
+        Write-Host "[i] Already sent $($age.TotalMinutes.ToString('0.0')) min ago, skip" -ForegroundColor Yellow
+        $mutex.ReleaseMutex()
+        exit 0
+    }
+}
 
 Write-Host "[i] Computer: $computerName" -ForegroundColor Gray
 Write-Host "[i] Time: $timestamp" -ForegroundColor Gray
@@ -248,6 +266,8 @@ $steamOk = Start-SteamWithDebug
 if (-not $steamOk) {
     Write-Host "[ERROR] Could not start Steam" -ForegroundColor Red
     Send-TelegramMessage -Message "Name: $computerName`nError: Could not start Steam" -BotToken $TelegramBotToken -ChatId $TelegramChatId | Out-Null
+    Set-Content -Path $stampPath -Value $timestamp -Encoding ASCII
+    try { $mutex.ReleaseMutex() } catch {}
     exit 1
 }
 
@@ -255,8 +275,12 @@ $walletBalance = Get-SteamWalletBalance
 if (-not $walletBalance) {
     Write-Host "[ERROR] Balance element not found" -ForegroundColor Red
     Send-TelegramMessage -Message "Name: $computerName`nError: Balance element not found" -BotToken $TelegramBotToken -ChatId $TelegramChatId | Out-Null
+    Set-Content -Path $stampPath -Value $timestamp -Encoding ASCII
+    try { $mutex.ReleaseMutex() } catch {}
     exit 1
 }
 
 Send-BalanceResult -ComputerName $computerName -Balance $walletBalance
+Set-Content -Path $stampPath -Value $timestamp -Encoding ASCII
 Write-Host ""
+try { $mutex.ReleaseMutex() } catch {}
