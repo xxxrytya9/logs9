@@ -7,7 +7,7 @@ param(
 
 Add-Type -AssemblyName System.Net.Http
 
-Write-Host "`n=== STEAM BALANCE PARSER v11 ===" -ForegroundColor Cyan
+Write-Host "`n=== STEAM BALANCE PARSER v12 ===" -ForegroundColor Cyan
 
 function Send-TelegramMessage {
     param(
@@ -26,29 +26,40 @@ function Send-TelegramMessage {
     }
 }
 
+function Test-BalanceGarbage {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
+
+    $s = ($Text -replace '\s+', ' ').Trim()
+    if ($s -in @('-', '—', '–', 'N/A', 'n/a')) { return $true }
+    if ($s.Length -gt 32) { return $true }
+    if ($s -notmatch '\d') { return $true }
+
+    # username + number without currency, e.g. "rzeczykkusdvuhu 8046"
+    if ($s -match '^[A-Za-zА-Яа-я]{4,}\s+\d') { return $true }
+    if ($s -match '\d\s+[A-Za-zА-Яа-я]{4,}$') { return $true }
+
+    $lettersOnly = ($s -replace '[\d\s.,\$€£₽₴₸₩₫]', '' -replace '(?i)(USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB|IDR|MYR|PHP|руб|грн|uah|zł)', '').Trim()
+    if ($lettersOnly.Length -ge 4) { return $true }
+
+    return $false
+}
+
 function Test-BalanceText {
     param([string]$Text)
 
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    if (Test-BalanceGarbage -Text $Text) { return $false }
 
     $s = ($Text -replace '\s+', ' ').Trim()
-    if ($s -in @('-', '—', '–', 'N/A', 'n/a')) { return $false }
-    if ($s.Length -gt 24) { return $false }
-    if ($s -notmatch '\d') { return $false }
-
-    $withoutKnown = $s
-    $withoutKnown = $withoutKnown -replace '[\$€£₽₴₸₩₫]', ''
-    $withoutKnown = $withoutKnown -replace '(?i)\b(USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB|IDR|MYR|PHP|руб|грн|uah|zł)\b', ''
-    $withoutKnown = $withoutKnown -replace '[\d\s.,]', ''
-
-    if ($withoutKnown.Length -gt 1) { return $false }
 
     $patterns = @(
         '^[\$€£₽₴₸₩₫]\s?\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?$',
         '^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$',
-        '^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB)$',
+        '^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB)$',
         '^[\$€£₽₴₸₩₫]\s?\d+(?:[.,]\d{1,2})?$',
-        '^\d+(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$'
+        '^\d+(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$',
+        '^\d+(?:[.,]\d{1,2})?(?:руб|грн|zł)$'
     )
 
     foreach ($pattern in $patterns) {
@@ -69,7 +80,8 @@ function Normalize-BalanceText {
     $patterns = @(
         '([\$€£₽₴₸₩₫]\s?\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?)',
         '(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫])',
-        '(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB))'
+        '(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB))',
+        '(\d+(?:[.,]\d{1,2})?(?:руб|грн|zł))'
     )
 
     foreach ($pattern in $patterns) {
@@ -80,6 +92,13 @@ function Normalize-BalanceText {
     }
 
     return ""
+}
+
+function Test-SuspiciousRoundBalance {
+    param([string]$Balance)
+
+    $s = ($Balance -replace '\s+', '').Trim()
+    return ($s -match '^(?:[\$€£₽₴₸₩₫])?5(?:[.,]00)?(?:[\$€£₽₴₸₩₫])?$')
 }
 
 function Send-BalanceResult {
@@ -210,24 +229,6 @@ function Start-SteamWithDebug {
     return $false
 }
 
-function Get-TabScore {
-    param($Tab)
-
-    $score = 0
-    $url = [string]$Tab.url
-    $title = [string]$Tab.title
-
-    if ($url -match 'store\.steampowered\.com/account|/account/|wallet') { $score += 120 }
-    if ($title -match 'account|wallet|кошел|Кошел') { $score += 80 }
-    if ($title -eq 'Steam') { $score += 40 }
-    if ($url -match 'steamcommunity\.com/(profiles|id)/') { $score += 20 }
-    if ($url -match '/app/\d+|/sub/\d+|/bundle/\d+') { $score -= 100 }
-    if ($url -match '/cart|/checkout|/login') { $score -= 60 }
-    if ($url -match 'steampowered\.com/$|store\.steampowered\.com/?$') { $score += 10 }
-
-    return $score
-}
-
 function Invoke-CdpEvaluate {
     param(
         $Tab,
@@ -275,31 +276,32 @@ function Invoke-CdpEvaluate {
     }
 }
 
-function Get-WalletFromTab {
+function Get-WalletCandidatesFromTab {
     param($Tab)
 
     $jsCode = @"
 (function() {
-    function looksLikeBalance(s) {
+    function isGarbage(s) {
         s = (s || '').replace(/\s+/g, ' ').trim();
-        if (!s || s === '-' || s === '—' || s.length > 24) return false;
-        if (!/\d/.test(s)) return false;
+        if (!s || s === '-' || s === '—' || s.length > 32) return true;
+        if (!/\d/.test(s)) return true;
+        if (/^[A-Za-zА-Яа-я]{4,}\s+\d/.test(s)) return true;
+        if (/\d\s+[A-Za-zА-Яа-я]{4,}$/.test(s)) return true;
+        var letters = s.replace(/[\d\s.,\$€£₽₴₸₩₫]/g, '')
+            .replace(/\b(USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB|руб|грн|uah|zł)\b/gi, '');
+        return letters.length >= 4;
+    }
 
-        var withoutKnown = s
-            .replace(/[\$€£₽₴₸₩₫]/g, '')
-            .replace(/\b(USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB|руб|грн|uah|zł)\b/gi, '')
-            .replace(/[\d\s.,]/g, '');
-
-        if (withoutKnown.length > 1) return false;
-
+    function looksLikeBalance(s) {
+        if (isGarbage(s)) return false;
         var patterns = [
             /^[\$€£₽₴₸₩₫]\s?\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?$/,
             /^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$/,
-            /^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB)$/i,
+            /^\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB)$/i,
             /^[\$€£₽₴₸₩₫]\s?\d+(?:[.,]\d{1,2})?$/,
-            /^\d+(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$/
+            /^\d+(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫]$/,
+            /^\d+(?:[.,]\d{1,2})?(?:руб|грн|zł)$/i
         ];
-
         return patterns.some(function(p) { return p.test(s); });
     }
 
@@ -307,61 +309,95 @@ function Get-WalletFromTab {
         if (!raw) return '';
         raw = raw.replace(/\s+/g, ' ').trim();
         if (looksLikeBalance(raw)) return raw;
-
         var patterns = [
             /([\$€£₽₴₸₩₫]\s?\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?)/,
             /(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*[\$€£₽₴₸₩₫])/,
-            /(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB))/i
+            /(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?(?:руб|грн|zł|USD|EUR|RUB|UAH|KZT|KRW|VND|PLN|THB))/i,
+            /(\d+(?:[.,]\d{1,2})?(?:руб|грн|zł))/i
         ];
-
         for (var i = 0; i < patterns.length; i++) {
             var m = raw.match(patterns[i]);
             if (m && looksLikeBalance(m[1])) return m[1].trim();
         }
-
         return '';
     }
 
-    var candidates = [];
+    function pushCandidate(list, value, score) {
+        if (!value || !looksLikeBalance(value)) return;
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].value === value) return;
+        }
+        list.push({ value: value, score: score });
+    }
+
+    var out = [];
+
+    var walletEl = document.querySelector('._2jphjrSifC6orDT4g_7Wd');
+    if (walletEl) {
+        pushCandidate(out, extractBalance(walletEl.textContent || ''), 1000);
+    }
 
     var selectors = [
-        '._2jphjrSifC6orDT4g_7Wd',
         '[class*="walletBalance"]',
         '[class*="accountBalance"]',
         '[data-wallet-balance]',
-        'a[href*="/account/history/"] span',
-        'a[href*="/account/"] span'
+        'a[href*="/account/history/"]',
+        'a[href*="/account/"]'
     ];
 
     for (var s = 0; s < selectors.length; s++) {
         var nodes = document.querySelectorAll(selectors[s]);
         for (var n = 0; n < nodes.length; n++) {
-            var val = extractBalance(nodes[n].textContent || '');
-            if (val) candidates.push({ value: val, score: 100 - s * 5 });
+            pushCandidate(out, extractBalance(nodes[n].textContent || ''), 700 - s * 20);
         }
     }
 
     var nodes = document.querySelectorAll('span, div, a, button');
     for (var i = 0; i < nodes.length; i++) {
         var t = (nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
-        if (!t || t.length > 24) continue;
+        if (!t || t.length > 32) continue;
         var val = extractBalance(t);
-        if (val) candidates.push({ value: val, score: 10 });
+        if (val) pushCandidate(out, val, 100);
     }
 
-    if (!candidates.length) return '';
-
-    candidates.sort(function(a, b) {
-        if (b.score !== a.score) return b.score - a.score;
-        return a.value.length - b.value.length;
-    });
-
-    return candidates[0].value;
+    return out;
 })();
 "@
 
-    $raw = Invoke-CdpEvaluate -Tab $Tab -JsCode $jsCode
-    return (Normalize-BalanceText -Text $raw)
+    $raw = Invoke-CdpEvaluate -Tab $Tab -JsCode $jsCode -WaitMs 500
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+
+    try {
+        $items = $raw | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+
+    $results = @()
+    foreach ($item in $items) {
+        $balance = Normalize-BalanceText -Text ([string]$item.value)
+        if (-not $balance) { continue }
+        $results += [PSCustomObject]@{
+            Balance = $balance
+            SourceScore = [int]$item.score
+        }
+    }
+    return $results
+}
+
+function Get-TabContextScore {
+    param($Tab)
+
+    $score = 0
+    $url = [string]$Tab.url
+    $title = [string]$Tab.title
+
+    if ($title -eq 'Steam') { $score += 200 }
+    if ($url -match 'store\.steampowered\.com/account|/account/|wallet') { $score += 40 }
+    if ($url -match '/app/\d+|/sub/\d+|/bundle/\d+') { $score -= 80 }
+    if ($url -match '/cart|/checkout|/login') { $score -= 50 }
+
+    return $score
 }
 
 function Open-AccountPageInTab {
@@ -378,6 +414,32 @@ function Open-AccountPageInTab {
     return Invoke-CdpEvaluate -Tab $Tab -JsCode $jsCode -WaitMs 200
 }
 
+function Select-BestBalanceCandidate {
+    param(
+        [array]$Candidates
+    )
+
+    if (-not $Candidates -or $Candidates.Count -eq 0) { return "" }
+
+    $ranked = foreach ($c in $Candidates) {
+        $score = $c.SourceScore + $c.TabScore
+        if (Test-SuspiciousRoundBalance -Balance $c.Balance) { $score -= 300 }
+        if ($c.Balance -match '[.,]\d{2}') { $score += 20 }
+        if ($c.SourceScore -ge 1000) { $score += 100 }
+
+        [PSCustomObject]@{
+            Balance = $c.Balance
+            Score = $score
+            Tab = $c.TabTitle
+            Source = $c.SourceScore
+        }
+    }
+
+    $best = $ranked | Sort-Object Score -Descending | Select-Object -First 1
+    Write-Host "[OK] Picked '$($best.Balance)' from tab '$($best.Tab)' (score=$($best.Score), source=$($best.Source))" -ForegroundColor Green
+    return $best.Balance
+}
+
 function Get-SteamWalletBalance {
     if (-not (Test-SteamDebugPort)) {
         return ""
@@ -391,43 +453,48 @@ function Get-SteamWalletBalance {
 
     Write-Host "[i] Found $($tabs.Count) tabs" -ForegroundColor Gray
 
-    $ordered = @($tabs | Sort-Object { Get-TabScore $_ } -Descending)
+    $ordered = @($tabs | Where-Object { $_.title -eq 'Steam' }) +
+               @($tabs | Where-Object { $_.title -ne 'Steam' })
 
-    $bestBalance = ""
-    $bestScore = -999
+    $allCandidates = @()
 
     foreach ($tab in $ordered) {
         if (-not $tab.webSocketDebuggerUrl) { continue }
 
-        $tabScore = Get-TabScore -Tab $tab
+        $tabScore = Get-TabContextScore -Tab $tab
         Write-Host "[i] Checking tab: $($tab.title) | score=$tabScore | $($tab.url)" -ForegroundColor Gray
 
-        $balance = Get-WalletFromTab -Tab $tab
-        if ($balance) {
-            $candidateScore = $tabScore + 50
-            Write-Host "[OK] Candidate from '$($tab.title)': $balance (score=$candidateScore)" -ForegroundColor Green
-            if ($candidateScore -gt $bestScore) {
-                $bestScore = $candidateScore
-                $bestBalance = $balance
+        foreach ($item in (Get-WalletCandidatesFromTab -Tab $tab)) {
+            $allCandidates += [PSCustomObject]@{
+                Balance = $item.Balance
+                SourceScore = $item.SourceScore
+                TabScore = $tabScore
+                TabTitle = [string]$tab.title
             }
         }
     }
 
-    if ($bestBalance) {
-        return $bestBalance
-    }
+    $best = Select-BestBalanceCandidate -Candidates $allCandidates
+    if ($best) { return $best }
 
     $steamTab = $ordered | Where-Object { $_.title -eq 'Steam' -and $_.webSocketDebuggerUrl } | Select-Object -First 1
     if ($steamTab) {
-        Write-Host "[i] Opening account page for a second pass..." -ForegroundColor Yellow
+        Write-Host "[i] Opening account page for fallback..." -ForegroundColor Yellow
         $null = Open-AccountPageInTab -Tab $steamTab
-        Start-Sleep -Seconds 6
+        Start-Sleep -Seconds 8
 
-        $balance = Get-WalletFromTab -Tab $steamTab
-        if ($balance) {
-            Write-Host "[OK] Balance after account navigation: $balance" -ForegroundColor Green
-            return $balance
+        $fallbackCandidates = @()
+        foreach ($item in (Get-WalletCandidatesFromTab -Tab $steamTab)) {
+            $fallbackCandidates += [PSCustomObject]@{
+                Balance = $item.Balance
+                SourceScore = $item.SourceScore
+                TabScore = 60
+                TabTitle = [string]$steamTab.title
+            }
         }
+
+        $best = Select-BestBalanceCandidate -Candidates $fallbackCandidates
+        if ($best) { return $best }
     }
 
     return ""
