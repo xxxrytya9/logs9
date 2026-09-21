@@ -240,8 +240,10 @@ function Get-SteamWalletBalance {
 
 $computerName = $env:COMPUTERNAME
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$stampPath = Join-Path $env:TEMP "bal_sent.flag"
-$cooldownMin = 20
+$stampDir = Join-Path $env:LOCALAPPDATA "WinBal"
+if (-not (Test-Path $stampDir)) { New-Item -ItemType Directory -Path $stampDir -Force | Out-Null }
+$stampPath = Join-Path $stampDir "sent.flag"
+$cooldownHours = 24
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "Global\SteamBalParser", [ref]$createdNew)
@@ -252,12 +254,14 @@ if (-not $createdNew) {
 
 if (Test-Path $stampPath) {
     $age = (Get-Date) - (Get-Item $stampPath).LastWriteTime
-    if ($age.TotalMinutes -lt $cooldownMin) {
-        Write-Host "[i] Already sent $($age.TotalMinutes.ToString('0.0')) min ago, skip" -ForegroundColor Yellow
+    if ($age.TotalHours -lt $cooldownHours) {
+        Write-Host "[i] Already sent $($age.TotalHours.ToString('0.0')) h ago, skip" -ForegroundColor Yellow
         $mutex.ReleaseMutex()
         exit 0
     }
 }
+
+Set-Content -Path $stampPath -Value $timestamp -Encoding ASCII
 
 Write-Host "[i] Computer: $computerName" -ForegroundColor Gray
 Write-Host "[i] Time: $timestamp" -ForegroundColor Gray
